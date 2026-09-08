@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 027
+
+exec > >(tee -a /var/log/homelab-bootstrap.log | logger -t homelab-bootstrap -s 2>/dev/console) 2>&1
+trap 'echo "bootstrap failed at line $LINENO: $BASH_COMMAND"' ERR
+
+APPLICATION_USER='${application_user}'
+APPLICATION_UID='${application_uid}'
+APPLICATION_GROUP="$APPLICATION_USER"
+APPLICATION_GID="$APPLICATION_UID"
+STATE_DEVICE='/dev/disk/by-id/google-${state_device_name}'
+STATE_MOUNTPOINT='${state_mountpoint}'
+SUBID_START=200000
+SUBID_COUNT=65536
+BOOTSTRAP_DIR=/var/lib/homelab-bootstrap
+PACKAGES_STAMP="$BOOTSTRAP_DIR/packages-v2"
+READY_STAMP="$BOOTSTRAP_DIR/phase1.ready"
+
+mkdir -p "$BOOTSTRAP_DIR"
+
+if [ ! -f "$PACKAGES_STAMP" ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o Acquire::Retries=5 update
+  apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    dbus-user-session \
+    e2fsprogs \
+    fuse-overlayfs \
+    git \
+    jq \
+    podman \
+    podman-compose \
+    rsync \
+    slirp4netns \
+    uidmap \
+    golang-github-containernetworking-plugin-dnsname \
+    util-linux
+  touch "$PACKAGES_STAMP"
+fi
+
+# Install the trusted GitHub server identity.
+GITHUB_HOST_KEY='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+
+install -d -m 0755 /etc/ssh
+touch /etc/ssh/ssh_known_hosts
+chown root:root /etc/ssh/ssh_known_hosts
+chmod 0644 /etc/ssh/ssh_known_hosts
+
+if ! grep -qxF "$GITHUB_HOST_KEY" /etc/ssh/ssh_known_hosts; then
+  printf '%s\n' "$GITHUB_HOST_KEY" >> /etc/ssh/ssh_known_hosts
+fi
+
+if getent group "$APPLICATION_GROUP" >/dev/null; then
+  EXISTING_GID=$(getent group "$APPLICATION_GROUP" | cut -d: -f3)
+  if [ "$EXISTING_GID" != "$APPLICATION_GID" ]; then
+    echo "$APPLICATION_GROUP already exists with GID $EXISTING_GID" >&2
+    exit 1
+  fi
+elif getent group "$APPLICATION_GID" >/dev/null; then
+  EXISTING_GROUP=$(getent group "$APPLICATION_GID" | cut -d: -f1)
+  echo "GID $APPLICATION_GID is already used by $EXISTING_GROUP" >&2
+  exit 1
+else
+  groupadd --gid "$APPLICATION_GID" "$APPLICATION_GROUP"
+fi
+
+if id -u "$APPLICATION_USER" >/dev/null 2>&1; then
+  EXISTING_UID=$(id -u "$APPLICATION_USER")
+  if [ "$EXISTING_UID" != "$APPLICATION_UID" ]; then
+    echo "$APPLICATION_USER already exists with UID $EXISTING_UID" >&2
+    exit 1
+  fi
+
+  EXISTING_PRIMARY_GID=$(id -g "$APPLICATION_USER")
+  if [ "$EXISTING_PRIMARY_GID" != "$APPLICATION_GID" ]; then
+    echo "$APPLICATION_USER has primary GID $EXISTING_PRIMARY_GID" >&2
+    exit 1
+  fi
+elif getent passwd "$APPLICATION_UID" >/dev/null; then
+  EXISTING_USER=$(getent passwd "$APPLICATION_UID" | cut -d: -f1)
+  echo "UID $APPLICATION_UID is already used by $EXISTING_USER" >&2
+  exit 1
+else
+  useradd \
+    --uid "$APPLICATION_UID" \
+    --gid "$APPLICATION_GID" \
+    --create-home \
+    --shell /bin/bash \
+    "$APPLICATION_USER"
+fi
+
+# Keep the subordinate-ID mapping stable so restored rootless-container file
+# ownership has the same numeric meaning on every replacement VM.
+sed -i "/^$APPLICATION_USER:/d" /etc/subuid
+sed -i "/^$APPLICATION_USER:/d" /etc/subgid
+echo "$APPLICATION_USER:$SUBID_START:$SUBID_COUNT" >> /etc/subuid
+echo "$APPLICATION_USER:$SUBID_START:$SUBID_COUNT" >> /etc/subgid
+
+loginctl enable-linger "$APPLICATION_USER"
+install -d -o "$APPLICATION_USER" -g "$APPLICATION_GROUP" -m 0750 /opt/gitops-vps
+
+cat > /etc/sysctl.d/99-rootless-podman-ports.conf <<'SYSCTL'
+net.ipv4.ip_unprivileged_port_start=80
+SYSCTL
+sysctl --system >/dev/null
+
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-homelab-hardening.conf <<'SSHD'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+PubkeyAuthentication yes
+X11Forwarding no
+SSHD
+/usr/sbin/sshd -t
+systemctl reload ssh.service
+
+udevadm settle
+for ATTEMPT in $(seq 1 60); do
+  if [ -b "$STATE_DEVICE" ]; then
+    break
+  fi
+  sleep 1
+done
+
+if [ ! -b "$STATE_DEVICE" ]; then
+  echo "State disk was not found at $STATE_DEVICE" >&2
+  exit 1
+fi
+
+FILESYSTEM_TYPE=$(blkid -s TYPE -o value "$STATE_DEVICE" || true)
+if [ -z "$FILESYSTEM_TYPE" ]; then
+  # A filesystem-less disk can still contain a partition table or another
+  # recognizable signature. Never overwrite one merely because blkid did not
+  # return a filesystem type for the whole device.
+  EXISTING_SIGNATURES=$(
+    wipefs --no-act --output TYPE --noheadings "$STATE_DEVICE" 2>/dev/null |
+      sed '/^[[:space:]]*$/d' || true
+  )
+  if [ -n "$EXISTING_SIGNATURES" ]; then
+    echo "Refusing to format a disk containing signatures:" >&2
+    echo "$EXISTING_SIGNATURES" >&2
+    exit 1
+  fi
+
+  echo "No filesystem detected; creating ext4 on the new state disk"
+  mkfs.ext4 -F -L homelab-state "$STATE_DEVICE"
+  FILESYSTEM_TYPE=ext4
+fi
+
+if [ "$FILESYSTEM_TYPE" != "ext4" ]; then
+  echo "Refusing to mount unexpected filesystem type: $FILESYSTEM_TYPE" >&2
+  exit 1
+fi
+
+STATE_UUID=$(blkid -s UUID -o value "$STATE_DEVICE")
+if [ -z "$STATE_UUID" ]; then
+  echo "State disk has no filesystem UUID" >&2
+  exit 1
+fi
+
+install -d -m 0755 "$STATE_MOUNTPOINT"
+if [ ! -e /etc/fstab.homelab-backup ]; then
+  cp -a /etc/fstab /etc/fstab.homelab-backup
+fi
+
+awk -v mountpoint="$STATE_MOUNTPOINT" '$2 != mountpoint { print $0 }' /etc/fstab > /etc/fstab.homelab-new
+printf 'UUID=%s %s ext4 defaults,nofail,x-systemd.device-timeout=60 0 2\n' \
+  "$STATE_UUID" "$STATE_MOUNTPOINT" >> /etc/fstab.homelab-new
+install -m 0644 /etc/fstab.homelab-new /etc/fstab
+rm -f /etc/fstab.homelab-new
+
+if ! mountpoint -q "$STATE_MOUNTPOINT"; then
+  mount "$STATE_MOUNTPOINT"
+fi
+
+mountpoint -q "$STATE_MOUNTPOINT"
+
+for DIRECTORY in \
+  caddy/config \
+  caddy/data \
+  grafana \
+  headscale \
+  qr-logger \
+  victoriametrics; do
+  install -d \
+    -o "$APPLICATION_USER" \
+    -g "$APPLICATION_GROUP" \
+    -m 0750 \
+    "$STATE_MOUNTPOINT/$DIRECTORY"
+done
+
+cat > /etc/systemd/system/homelab-state-ready.service <<EOF
+[Unit]
+Description=Verify the homelab state disk is mounted
+RequiresMountsFor=$STATE_MOUNTPOINT
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mountpoint -q $STATE_MOUNTPOINT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now homelab-state-ready.service
+
+date --iso-8601=seconds > "$READY_STAMP"
+echo "Phase 1 bootstrap completed successfully"

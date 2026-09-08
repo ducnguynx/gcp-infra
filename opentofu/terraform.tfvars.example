@@ -1,0 +1,20 @@
+project_id = "project-34235777-a27b-48da-a3a"
+
+region       = "asia-southeast1"
+zone         = "asia-southeast1-b"
+name_prefix  = "homelab"
+machine_type = "e2-standard-2"
+
+boot_disk_size_gb  = 20
+state_disk_size_gb = 30
+
+admin_username      = "duc"
+ssh_public_key_path = "~/.ssh/gcp-homelab_ed25519.pub"
+
+# Prefer ["YOUR.PUBLIC.IP.ADDRESS/32"] when your source IP is stable.
+# This open value is usable with a dynamic residential IP, but TCP/22 will be
+# visible to Internet scanners. SSH remains public-key-only.
+ssh_source_ranges = ["0.0.0.0/0"]
+
+application_user = "vps-app"
+application_uid  = 2000
