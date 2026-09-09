@@ -53,10 +53,28 @@ resource "google_compute_instance" "vps" {
     serial-port-enable     = "FALSE"
     ssh-keys               = "${var.admin_username}:${trimspace(file(pathexpand(var.ssh_public_key_path)))}"
     startup-script = templatefile("${path.module}/templates/bootstrap.sh.tftpl", {
-      application_user  = var.application_user
-      application_uid   = var.application_uid
-      state_device_name = local.state_disk_name
-      state_mountpoint  = "/srv/state"
+      application_user            = var.application_user
+      application_uid             = var.application_uid
+      state_device_name           = local.state_disk_name
+      state_mountpoint            = "/srv/state"
+      repository_bootstrap_script = file("${path.module}/templates/scripts/repository-bootstrap")
+      render_secrets_script       = file("${path.module}/templates/scripts/render-secrets")
+      deploy_script               = file("${path.module}/templates/scripts/deploy")
+      repository_unit = file(
+        "${path.module}/templates/systemd/homelab-repository.service"
+      )
+
+      secrets_unit = file(
+        "${path.module}/templates/systemd/homelab-secrets.service"
+      )
+
+      app_unit = file(
+        "${path.module}/templates/systemd/homelab-app.service"
+      )
+
+      deploy_unit = file(
+        "${path.module}/templates/systemd/homelab-deploy.service"
+      )
     })
   }
 

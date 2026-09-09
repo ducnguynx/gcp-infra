@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly APPLICATION_UID=2000
+readonly REPOSITORY_DIR=/opt/gitops-vps
+readonly REPOSITORY_URL=git@github.com:ducnguynx/gitops-vps.git
+readonly REPOSITORY_BRANCH=production
+readonly SECRET_NAME=github-deploy-key
+readonly METADATA_URL=http://metadata.google.internal/computeMetadata/v1
+readonly GLOBAL_KNOWN_HOSTS=/etc/ssh/ssh_known_hosts
+
+TEMPORARY_DIRECTORY=
+DEPLOY_KEY=
+
+fail() {
+    echo "repository bootstrap: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "$DEPLOY_KEY" && -f "$DEPLOY_KEY" ]]; then
+        rm -f -- "$DEPLOY_KEY"
+    fi
+
+    if [[ -n "$TEMPORARY_DIRECTORY" &&
+          -d "$TEMPORARY_DIRECTORY" ]]; then
+        rmdir -- "$TEMPORARY_DIRECTORY" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'fail "failed at line $LINENO"' ERR
+
+if [[ "$(id -u)" -ne "$APPLICATION_UID" ]]; then
+    fail "must run as UID $APPLICATION_UID"
+fi
+
+if [[ -L "$REPOSITORY_DIR" ]]; then
+    fail "$REPOSITORY_DIR must not be a symbolic link"
+fi
+
+if [[ ! -d "$REPOSITORY_DIR" ]]; then
+    fail "$REPOSITORY_DIR was not prepared by the root bootstrap"
+fi
+
+if [[ ! -O "$REPOSITORY_DIR" || ! -w "$REPOSITORY_DIR" ]]; then
+    fail "$REPOSITORY_DIR is not owned and writable by vps-app"
+fi
+
+if find "$REPOSITORY_DIR" -mindepth 1 -maxdepth 1 \
+        -print -quit | grep -q .; then
+
+    git -C "$REPOSITORY_DIR" rev-parse \
+        --is-inside-work-tree >/dev/null 2>&1 ||
+        fail "$REPOSITORY_DIR is non-empty but is not a Git checkout"
+
+    TOP_LEVEL="$(
+        git -C "$REPOSITORY_DIR" rev-parse --show-toplevel
+    )"
+
+    [[ "$TOP_LEVEL" == "$REPOSITORY_DIR" ]] ||
+        fail "$REPOSITORY_DIR is not the repository root"
+
+    ORIGIN_URL="$(
+        git -C "$REPOSITORY_DIR" remote get-url origin
+    )"
+
+    [[ "$ORIGIN_URL" == "$REPOSITORY_URL" ]] ||
+        fail "repository origin does not match the expected GitHub repository"
+
+    git -C "$REPOSITORY_DIR" rev-parse \
+        --verify 'HEAD^{commit}' >/dev/null ||
+        fail "repository has no valid checked-out commit"
+
+    [[ -z "$(git -C "$REPOSITORY_DIR" status --porcelain)" ]] ||
+        fail "repository working tree contains local changes"
+
+    echo "repository bootstrap: existing checkout is valid; no network access needed"
+    exit 0
+fi
+
+[[ -r "$GLOBAL_KNOWN_HOSTS" ]] ||
+    fail "$GLOBAL_KNOWN_HOSTS is unavailable"
+
+ssh-keygen -F github.com \
+    -f "$GLOBAL_KNOWN_HOSTS" >/dev/null ||
+    fail "github.com is absent from the system-wide known-hosts file"
+
+[[ "${XDG_RUNTIME_DIR:-}" == "/run/user/$APPLICATION_UID" ]] ||
+    fail "XDG_RUNTIME_DIR is missing or unexpected"
+
+TEMPORARY_DIRECTORY="$(
+    mktemp -d "$XDG_RUNTIME_DIR/homelab-repository.XXXXXX"
+)"
+DEPLOY_KEY="$TEMPORARY_DIRECTORY/deploy-key"
+
+PROJECT_ID="$(
+    curl --fail --silent --show-error \
+        --connect-timeout 3 \
+        --max-time 10 \
+        -H 'Metadata-Flavor: Google' \
+        "$METADATA_URL/project/project-id"
+)"
+
+ACCESS_TOKEN="$(
+    curl --fail --silent --show-error \
+        --connect-timeout 3 \
+        --max-time 10 \
+        -H 'Metadata-Flavor: Google' \
+        "$METADATA_URL/instance/service-accounts/default/token" |
+        jq -er '.access_token'
+)"
+
+curl --fail --silent --show-error \
+    --connect-timeout 3 \
+    --max-time 20 \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    "https://secretmanager.googleapis.com/v1/projects/$PROJECT_ID/secrets/$SECRET_NAME/versions/latest:access" |
+    jq -er '.payload.data' |
+    base64 --decode >"$DEPLOY_KEY"
+
+unset ACCESS_TOKEN
+chmod 0600 "$DEPLOY_KEY"
+
+ssh-keygen -y -f "$DEPLOY_KEY" >/dev/null ||
+    fail "Secret Manager did not return a usable SSH private key"
+
+SSH_COMMAND="/usr/bin/ssh \
+-i $DEPLOY_KEY \
+-o IdentitiesOnly=yes \
+-o BatchMode=yes \
+-o StrictHostKeyChecking=yes \
+-o UserKnownHostsFile=/dev/null \
+-o GlobalKnownHostsFile=$GLOBAL_KNOWN_HOSTS"
+
+GIT_TERMINAL_PROMPT=0 \
+GIT_SSH_COMMAND="$SSH_COMMAND" \
+git clone \
+    --branch "$REPOSITORY_BRANCH" \
+    --single-branch \
+    "$REPOSITORY_URL" \
+    "$REPOSITORY_DIR"
+
+echo "repository bootstrap: production checkout cloned successfully"

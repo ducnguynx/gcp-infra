@@ -1,0 +1,31 @@
+[Unit]
+Description=Run the homelab container stack
+Wants=network-online.target
+After=network-online.target
+Requires=homelab-state-ready.service
+After=homelab-state-ready.service
+Requires=homelab-repository.service
+After=homelab-repository.service
+Requires=homelab-secrets.service
+After=homelab-secrets.service
+Requires=user-runtime-dir@2000.service
+After=user-runtime-dir@2000.service
+
+[Service]
+Type=oneshot
+User=vps-app
+Group=vps-app
+Environment=HOME=/home/vps-app
+Environment=XDG_RUNTIME_DIR=/run/user/2000
+WorkingDirectory=/opt/gitops-vps
+ExecStartPre=/bin/sh -c '/usr/bin/podman-compose --dry-run up -d --force-recreate --remove-orphans >/dev/null'
+ExecStart=/usr/bin/podman-compose up -d --force-recreate --remove-orphans
+ExecStop=/usr/bin/podman-compose down
+RemainAfterExit=yes
+Delegate=yes
+UMask=0027
+TimeoutStartSec=15min
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=multi-user.target

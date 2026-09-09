@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly APPLICATION_UID=2000
+readonly REPOSITORY_DIR=/opt/gitops-vps
+readonly REPOSITORY_URL=git@github.com:ducnguynx/gitops-vps.git
+readonly PRODUCTION_BRANCH=production
+readonly SECRET_NAME=github-deploy-key
+readonly METADATA_URL=http://metadata.google.internal/computeMetadata/v1
+readonly GLOBAL_KNOWN_HOSTS=/etc/ssh/ssh_known_hosts
+readonly LOCK_FILE=/run/user/2000/homelab-deploy.lock
+
+TEMPORARY_DIRECTORY=
+DEPLOY_KEY=
+
+fail() {
+    echo "homelab deploy: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "$DEPLOY_KEY" && -f "$DEPLOY_KEY" ]]; then
+        rm -f -- "$DEPLOY_KEY"
+    fi
+
+    if [[ -n "$TEMPORARY_DIRECTORY" &&
+          -d "$TEMPORARY_DIRECTORY" ]]; then
+        rmdir -- "$TEMPORARY_DIRECTORY" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT
+trap 'fail "failed at line $LINENO"' ERR
+
+if [[ "$(id -u)" -ne "$APPLICATION_UID" ]]; then
+    fail "must run as UID $APPLICATION_UID"
+fi
+
+[[ "${XDG_RUNTIME_DIR:-}" == "/run/user/$APPLICATION_UID" ]] ||
+    fail "XDG_RUNTIME_DIR is missing or unexpected"
+
+# Keep this descriptor open for the entire deployment.
+exec 9>"$LOCK_FILE"
+
+flock -n 9 ||
+    fail "another deployment is already running"
+
+# Recheck the checkout immediately before performing destructive operations.
+/usr/local/libexec/homelab/repository-bootstrap
+
+[[ -r "$GLOBAL_KNOWN_HOSTS" ]] ||
+    fail "$GLOBAL_KNOWN_HOSTS is unavailable"
+
+ssh-keygen -F github.com \
+    -f "$GLOBAL_KNOWN_HOSTS" >/dev/null ||
+    fail "github.com is absent from the system-wide known-hosts file"
+
+PREVIOUS_COMMIT="$(
+    git -C "$REPOSITORY_DIR" rev-parse HEAD
+)"
+
+TEMPORARY_DIRECTORY="$(
+    mktemp -d "$XDG_RUNTIME_DIR/homelab-deploy.XXXXXX"
+)"
+DEPLOY_KEY="$TEMPORARY_DIRECTORY/deploy-key"
+
+PROJECT_ID="$(
+    curl --fail --silent --show-error \
+        --connect-timeout 3 \
+        --max-time 10 \
+        -H 'Metadata-Flavor: Google' \
+        "$METADATA_URL/project/project-id"
+)"
+
+ACCESS_TOKEN="$(
+    curl --fail --silent --show-error \
+        --connect-timeout 3 \
+        --max-time 10 \
+        -H 'Metadata-Flavor: Google' \
+        "$METADATA_URL/instance/service-accounts/default/token" |
+        jq -er '.access_token'
+)"
+
+curl --fail --silent --show-error \
+    --connect-timeout 3 \
+    --max-time 20 \
+    -H "Authorization: Bearer $ACCESS_TOKEN" \
+    "https://secretmanager.googleapis.com/v1/projects/$PROJECT_ID/secrets/$SECRET_NAME/versions/latest:access" |
+    jq -er '.payload.data | select(type == "string")' |
+    base64 --decode >"$DEPLOY_KEY"
+
+unset ACCESS_TOKEN
+
+[[ -s "$DEPLOY_KEY" ]] ||
+    fail "Secret Manager returned an empty deploy key"
+
+chmod 0600 "$DEPLOY_KEY"
+
+ssh-keygen -y -f "$DEPLOY_KEY" >/dev/null ||
+    fail "Secret Manager did not return a usable SSH private key"
+
+SSH_COMMAND="/usr/bin/ssh \
+-i $DEPLOY_KEY \
+-o IdentitiesOnly=yes \
+-o BatchMode=yes \
+-o ConnectTimeout=10 \
+-o StrictHostKeyChecking=yes \
+-o UserKnownHostsFile=/dev/null \
+-o GlobalKnownHostsFile=$GLOBAL_KNOWN_HOSTS"
+
+GIT_TERMINAL_PROMPT=0 \
+GIT_SSH_COMMAND="$SSH_COMMAND" \
+git -C "$REPOSITORY_DIR" fetch \
+    --no-tags \
+    --prune \
+    origin \
+    "+refs/heads/$PRODUCTION_BRANCH:refs/remotes/origin/$PRODUCTION_BRANCH"
+
+# GitHub access is complete. Remove the private key before doing anything else.
+rm -f -- "$DEPLOY_KEY"
+DEPLOY_KEY=
+
+rmdir -- "$TEMPORARY_DIRECTORY"
+TEMPORARY_DIRECTORY=
+
+TARGET_COMMIT="$(
+    git -C "$REPOSITORY_DIR" rev-parse \
+        --verify "refs/remotes/origin/$PRODUCTION_BRANCH^{commit}"
+)"
+
+echo "homelab deploy: previous commit $PREVIOUS_COMMIT"
+echo "homelab deploy: target commit   $TARGET_COMMIT"
+
+git -C "$REPOSITORY_DIR" checkout \
+    -B "$PRODUCTION_BRANCH" \
+    "$TARGET_COMMIT"
+
+git -C "$REPOSITORY_DIR" branch \
+    --set-upstream-to="origin/$PRODUCTION_BRANCH" \
+    "$PRODUCTION_BRANCH" >/dev/null
+
+git -C "$REPOSITORY_DIR" reset \
+    --hard "$TARGET_COMMIT"
+
+# Remove all untracked and ignored files from the disposable checkout.
+git -C "$REPOSITORY_DIR" clean -fdx
+
+/usr/local/libexec/homelab/repository-bootstrap
+/usr/local/libexec/homelab/render-secrets
+
+cd "$REPOSITORY_DIR"
+
+/usr/bin/podman-compose \
+    --dry-run \
+    up -d \
+    --force-recreate \
+    --remove-orphans \
+    >/dev/null
+
+DEPLOYED_COMMIT="$(
+    git -C "$REPOSITORY_DIR" rev-parse HEAD
+)"
+
+echo "homelab deploy: deployment completed at $TARGET_COMMIT"

@@ -15,9 +15,14 @@ SUBID_START=200000
 SUBID_COUNT=65536
 BOOTSTRAP_DIR=/var/lib/homelab-bootstrap
 PACKAGES_STAMP="$BOOTSTRAP_DIR/packages-v2"
-READY_STAMP="$BOOTSTRAP_DIR/phase1.ready"
+READY_STAMP="$BOOTSTRAP_DIR/phase2.ready"
 
 mkdir -p "$BOOTSTRAP_DIR"
+
+if [ -f "$READY_STAMP" ]; then
+  echo "Phase 2 bootstrap already completed; systemd manages normal boot"
+  exit 0
+fi
 
 if [ ! -f "$PACKAGES_STAMP" ]; then
   export DEBIAN_FRONTEND=noninteractive
@@ -101,10 +106,69 @@ echo "$APPLICATION_USER:$SUBID_START:$SUBID_COUNT" >> /etc/subgid
 loginctl enable-linger "$APPLICATION_USER"
 install -d -o "$APPLICATION_USER" -g "$APPLICATION_GROUP" -m 0750 /opt/gitops-vps
 
+
+install -d \
+  -o root \
+  -g root \
+  -m 0755 \
+  /usr/local/libexec/homelab
+
+cat > /usr/local/libexec/homelab/repository-bootstrap <<'REPOSITORY_BOOTSTRAP'
+${repository_bootstrap_script}
+REPOSITORY_BOOTSTRAP
+
+cat > /usr/local/libexec/homelab/render-secrets <<'RENDER_SECRETS'
+${render_secrets_script}
+RENDER_SECRETS
+
+cat > /usr/local/libexec/homelab/deploy <<'DEPLOY_SCRIPT'
+${deploy_script}
+DEPLOY_SCRIPT
+
+chown root:root \
+  /usr/local/libexec/homelab/repository-bootstrap \
+  /usr/local/libexec/homelab/render-secrets \
+  /usr/local/libexec/homelab/deploy
+
+chmod 0755 \
+  /usr/local/libexec/homelab/repository-bootstrap \
+  /usr/local/libexec/homelab/render-secrets \
+  /usr/local/libexec/homelab/deploy
+
 cat > /etc/sysctl.d/99-rootless-podman-ports.conf <<'SYSCTL'
 net.ipv4.ip_unprivileged_port_start=80
 SYSCTL
 sysctl --system >/dev/null
+
+
+cat > /etc/systemd/system/homelab-repository.service <<'REPOSITORY_UNIT'
+${repository_unit}
+REPOSITORY_UNIT
+
+cat > /etc/systemd/system/homelab-secrets.service <<'SECRETS_UNIT'
+${secrets_unit}
+SECRETS_UNIT
+
+cat > /etc/systemd/system/homelab-app.service <<'APP_UNIT'
+${app_unit}
+APP_UNIT
+
+cat > /etc/systemd/system/homelab-deploy.service <<'DEPLOY_UNIT'
+${deploy_unit}
+DEPLOY_UNIT
+
+chown root:root \
+  /etc/systemd/system/homelab-repository.service \
+  /etc/systemd/system/homelab-secrets.service \
+  /etc/systemd/system/homelab-app.service \
+  /etc/systemd/system/homelab-deploy.service
+
+chmod 0644 \
+  /etc/systemd/system/homelab-repository.service \
+  /etc/systemd/system/homelab-secrets.service \
+  /etc/systemd/system/homelab-app.service \
+  /etc/systemd/system/homelab-deploy.service
+
 
 install -d -m 0755 /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-homelab-hardening.conf <<'SSHD'
@@ -182,7 +246,6 @@ mountpoint -q "$STATE_MOUNTPOINT"
 for DIRECTORY in \
   caddy/config \
   caddy/data \
-  grafana \
   headscale \
   qr-logger \
   victoriametrics; do
@@ -192,6 +255,16 @@ for DIRECTORY in \
     -m 0750 \
     "$STATE_MOUNTPOINT/$DIRECTORY"
 done
+
+# GRAFANA must be handled separately
+GRAFANA_CONTAINER_UID=472
+GRAFANA_HOST_UID=$((SUBID_START + GRAFANA_CONTAINER_UID - 1))
+
+install -d \
+  -o "$GRAFANA_HOST_UID" \
+  -g "$APPLICATION_GID" \
+  -m 0750 \
+  "$STATE_MOUNTPOINT/grafana"
 
 cat > /etc/systemd/system/homelab-state-ready.service <<EOF
 [Unit]
@@ -209,7 +282,13 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now homelab-state-ready.service
+
+systemctl enable \
+  homelab-state-ready.service \
+  homelab-app.service
+
+systemctl start homelab-state-ready.service
+systemctl start homelab-app.service
 
 date --iso-8601=seconds > "$READY_STAMP"
-echo "Phase 1 bootstrap completed successfully"
+echo "Phase 2 bootstrap completed successfully"
