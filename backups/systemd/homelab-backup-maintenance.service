@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply retention and verify homelab backups
+After=homelab-backup.service
+RequiresMountsFor=/home/homelab-backup/repository
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/homelab-backup-maintenance
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=yes
+NoNewPrivileges=yes

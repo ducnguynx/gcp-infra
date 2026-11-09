@@ -1,0 +1,54 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+readonly REPOSITORY="/home/homelab-backup/repository"
+readonly PASSWORD_FILE="/etc/homelab-backup/restic-password"
+readonly LOCK_FILE="/run/lock/homelab-backup.lock"
+readonly SNAPSHOT_HOST="homelab-vps"
+readonly SNAPSHOT_PATH="/home/homelab-backup/mirror/current"
+
+exec 9>"$LOCK_FILE"
+
+echo "Waiting for the homelab backup lock..."
+if ! /usr/bin/flock -w 7200 9; then
+    echo "Could not acquire backup lock within two hours." >&2
+    exit 1
+fi
+
+echo "Validating repository paths..."
+/usr/bin/mountpoint -q /home
+
+if [[ "$(/usr/bin/findmnt -n -o TARGET -T "$REPOSITORY")" != "/home" ]]; then
+    echo "Repository is not located on the /home filesystem." >&2
+    exit 1
+fi
+
+[[ -d "$REPOSITORY" ]] || {
+    echo "Restic repository is missing." >&2
+    exit 1
+}
+
+[[ -s "$PASSWORD_FILE" ]] || {
+    echo "Restic password file is missing or empty." >&2
+    exit 1
+}
+
+echo "Applying snapshot retention and pruning unused data..."
+/usr/bin/restic \
+    --repo "$REPOSITORY" \
+    --password-file "$PASSWORD_FILE" \
+    forget \
+    --host "$SNAPSHOT_HOST" \
+    --path "$SNAPSHOT_PATH" \
+    --keep-daily 7 \
+    --keep-weekly 4 \
+    --keep-monthly 6 \
+    --prune
+
+echo "Running structural repository verification..."
+/usr/bin/restic \
+    --repo "$REPOSITORY" \
+    --password-file "$PASSWORD_FILE" \
+    check
+
+echo "Weekly backup maintenance completed successfully."

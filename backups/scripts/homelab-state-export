@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly REMOTE_HOST="homelab-vps"
+readonly REMOTE_STATE="/srv/state"
+readonly REMOTE_UNIT="homelab-app.service"
+readonly LOCK_FILE="/run/lock/homelab-backup.lock"
+
+readonly EXPECTED_DIRS=(
+    caddy
+    grafana
+    headscale
+    qr-logger
+    victoriametrics
+)
+
+if (( EUID != 0 )); then
+    echo "Run this script with sudo." >&2
+    exit 1
+fi
+
+if [[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
+    echo "Run from your normal account using sudo, not from a root shell." >&2
+    exit 1
+fi
+
+readonly INVOKING_USER="$SUDO_USER"
+
+SSH=(
+    /usr/bin/sudo -H -u "$INVOKING_USER" --
+    /usr/bin/ssh
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    "$REMOTE_HOST"
+)
+
+exec 9>"$LOCK_FILE"
+if ! /usr/bin/flock -n 9; then
+    echo "Another homelab backup is already running." >&2
+    exit 1
+fi
+
+echo "Running remote preflight checks..."
+
+"${SSH[@]}" '
+    set -eu
+
+    mountpoint -q /srv/state
+    test "$(findmnt -n -o TARGET -T /srv/state)" = "/srv/state"
+    sudo -n systemctl is-active --quiet homelab-app.service
+    command -v rsync >/dev/null
+
+    for directory in \
+        caddy \
+        grafana \
+        headscale \
+        qr-logger \
+        victoriametrics
+    do
+        sudo -n test -d "/srv/state/$directory"
+    done
+'
+
+if [[ "$(findmnt -n -o FSTYPE -T /tmp)" != "tmpfs" ]]; then
+    echo "/tmp is no longer backed by tmpfs; refusing to continue." >&2
+    exit 1
+fi
+
+remote_bytes="$("${SSH[@]}" \
+    'sudo -n du -sbx /srv/state | cut -f1')"
+
+local_available="$(df -B1 --output=avail /tmp | awk 'NR == 2 {print $1}')"
+
+if [[ ! "$remote_bytes" =~ ^[0-9]+$ ]]; then
+    echo "Could not determine remote state size." >&2
+    exit 1
+fi
+
+# Require the dataset size plus 256 MiB of safety margin.
+required_bytes=$((remote_bytes + 268435456))
+
+if (( local_available < required_bytes )); then
+    echo "Insufficient space in /tmp." >&2
+    exit 1
+fi
+
+staging_path="$(mktemp -d /tmp/homelab-state.XXXXXXXX)"
+chmod 0700 "$staging_path"
+
+remote_may_need_start=0
+
+cleanup() {
+    exit_code=$?
+    trap - EXIT INT TERM HUP
+
+    if (( remote_may_need_start )); then
+        echo "Ensuring $REMOTE_UNIT is started..."
+
+        if ! "${SSH[@]}" \
+            "sudo -n systemctl start '$REMOTE_UNIT'"; then
+            echo "CRITICAL: failed to restart $REMOTE_UNIT" >&2
+            exit_code=1
+        fi
+    fi
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+echo "Stopping $REMOTE_UNIT..."
+remote_may_need_start=1
+"${SSH[@]}" "sudo -n systemctl stop '$REMOTE_UNIT'"
+
+if "${SSH[@]}" \
+    "sudo -n systemctl is-active --quiet '$REMOTE_UNIT'"; then
+    echo "$REMOTE_UNIT remained active after stop." >&2
+    exit 1
+fi
+
+echo "Flushing remote filesystem buffers..."
+"${SSH[@]}" "sudo -n sync -f '$REMOTE_STATE'"
+
+echo "Copying state into $staging_path..."
+
+rsync_rsh="/usr/bin/sudo -H -u $INVOKING_USER -- /usr/bin/ssh"
+rsync_rsh+=" -o BatchMode=yes -o StrictHostKeyChecking=yes"
+
+# A new mktemp directory is used every time, so --delete is unnecessary.
+rsync \
+    -aHAXx \
+    --numeric-ids \
+    --human-readable \
+    --info=stats2 \
+    --rsync-path="sudo -n rsync" \
+    --rsh="$rsync_rsh" \
+    "$REMOTE_HOST:$REMOTE_STATE/" \
+    "$staging_path/"
+
+echo "Restarting $REMOTE_UNIT..."
+"${SSH[@]}" "sudo -n systemctl start '$REMOTE_UNIT'"
+"${SSH[@]}" "sudo -n systemctl is-active --quiet '$REMOTE_UNIT'"
+remote_may_need_start=0
+
+for directory in "${EXPECTED_DIRS[@]}"; do
+    if [[ ! -d "$staging_path/$directory" ]]; then
+        echo "Expected directory is missing: $directory" >&2
+        exit 1
+    fi
+done
+
+echo
+echo "Export completed successfully."
+echo "Application service is active."
+printf 'Staging path: %s\n' "$staging_path"
+du -sh "$staging_path"

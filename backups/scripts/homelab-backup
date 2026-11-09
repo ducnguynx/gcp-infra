@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly LOCAL_SSH_USER="duc"
+readonly REMOTE_HOST="homelab-vps"
+readonly REMOTE_STATE="/srv/state"
+readonly REMOTE_UNIT="homelab-app.service"
+
+readonly BACKUP_ROOT="/home/homelab-backup"
+readonly MIRROR_ROOT="$BACKUP_ROOT/mirror"
+readonly MIRROR_CURRENT="$MIRROR_ROOT/current"
+readonly MIRROR_MARKER="$MIRROR_ROOT/.mirror-root"
+
+readonly RESTIC_REPOSITORY="$BACKUP_ROOT/repository"
+readonly RESTIC_PASSWORD_FILE="/etc/homelab-backup/restic-password"
+readonly LOCK_FILE="/run/lock/homelab-backup.lock"
+
+readonly EXPECTED_DIRS=(
+    caddy
+    grafana
+    headscale
+    qr-logger
+    victoriametrics
+)
+
+if (( EUID != 0 )); then
+    echo "Run this script with sudo." >&2
+    exit 1
+fi
+
+SSH=(
+    /usr/bin/sudo -H -u "$LOCAL_SSH_USER" --
+    /usr/bin/ssh
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=yes
+    "$REMOTE_HOST"
+)
+
+exec 9>"$LOCK_FILE"
+
+if ! /usr/bin/flock -n 9; then
+    echo "Another homelab backup is already running." >&2
+    exit 1
+fi
+
+echo "Validating local backup paths..."
+
+if [[ "$(realpath -e "$MIRROR_CURRENT")" != "$MIRROR_CURRENT" ]]; then
+    echo "Mirror path is missing, indirect or invalid." >&2
+    exit 1
+fi
+
+if [[ ! -f "$MIRROR_MARKER" || -L "$MIRROR_MARKER" ]]; then
+    echo "Mirror safety marker is missing or invalid." >&2
+    exit 1
+fi
+
+if [[ "$(findmnt -n -o TARGET -T "$MIRROR_CURRENT")" != "/home" ]]; then
+    echo "Mirror is not located on the /home filesystem." >&2
+    exit 1
+fi
+
+if [[ "$(stat -c '%u:%g:%a' "$MIRROR_ROOT")" != "0:0:700" ]]; then
+    echo "Unsafe ownership or permissions on $MIRROR_ROOT." >&2
+    exit 1
+fi
+
+if [[ "$(stat -c '%u:%g:%a' "$MIRROR_CURRENT")" != "0:0:700" ]]; then
+    echo "Unsafe ownership or permissions on $MIRROR_CURRENT." >&2
+    exit 1
+fi
+
+if [[ ! -d "$RESTIC_REPOSITORY" ]]; then
+    echo "Restic repository is missing." >&2
+    exit 1
+fi
+
+if [[ "$(stat -c '%u:%g:%a' "$RESTIC_PASSWORD_FILE")" != "0:0:600" ]]; then
+    echo "Unsafe Restic password-file permissions." >&2
+    exit 1
+fi
+
+# Verify repository access before stopping anything.
+/usr/bin/restic \
+    --repo "$RESTIC_REPOSITORY" \
+    --password-file "$RESTIC_PASSWORD_FILE" \
+    cat config >/dev/null
+
+echo "Running remote preflight checks..."
+
+"${SSH[@]}" '
+    set -eu
+
+    mountpoint -q /srv/state
+    test "$(findmnt -n -o TARGET -T /srv/state)" = "/srv/state"
+    sudo -n systemctl is-active --quiet homelab-app.service
+    command -v rsync >/dev/null
+
+    for directory in \
+        caddy \
+        grafana \
+        headscale \
+        qr-logger \
+        victoriametrics
+    do
+        sudo -n test -d "/srv/state/$directory"
+    done
+'
+
+remote_bytes="$("${SSH[@]}" \
+    'sudo -n du -sbx /srv/state | cut -f1')"
+
+local_available="$(
+    df -B1 --output=avail "$MIRROR_CURRENT" |
+    awk 'NR == 2 {print $1}'
+)"
+
+if [[ ! "$remote_bytes" =~ ^[0-9]+$ ]]; then
+    echo "Could not determine remote state size." >&2
+    exit 1
+fi
+
+# Conservative guard: enough free space for another complete copy plus 1 GiB.
+required_bytes=$((remote_bytes + 1073741824))
+
+if (( local_available < required_bytes )); then
+    echo "Insufficient space for a safe mirror update." >&2
+    exit 1
+fi
+
+remote_may_need_start=0
+
+cleanup() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+
+    # Rsync may temporarily inherit the source root's permissions.
+    if [[ -d "$MIRROR_CURRENT" ]]; then
+        chown root:root "$MIRROR_CURRENT" || exit_code=1
+        chmod 0700 "$MIRROR_CURRENT" || exit_code=1
+    fi
+
+    if (( remote_may_need_start )); then
+        echo "Ensuring $REMOTE_UNIT is started..."
+
+        if ! "${SSH[@]}" \
+            "sudo -n systemctl start '$REMOTE_UNIT'"; then
+            echo "CRITICAL: failed to restart $REMOTE_UNIT" >&2
+            exit_code=1
+        fi
+    fi
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+echo "Stopping $REMOTE_UNIT..."
+remote_may_need_start=1
+"${SSH[@]}" "sudo -n systemctl stop '$REMOTE_UNIT'"
+
+if "${SSH[@]}" \
+    "sudo -n systemctl is-active --quiet '$REMOTE_UNIT'"; then
+    echo "$REMOTE_UNIT remained active after stop." >&2
+    exit 1
+fi
+
+echo "Flushing remote filesystem buffers..."
+"${SSH[@]}" "sudo -n sync -f '$REMOTE_STATE'"
+
+echo "Incrementally updating persistent mirror..."
+
+rsync_rsh="/usr/bin/sudo -H -u $LOCAL_SSH_USER -- /usr/bin/ssh"
+rsync_rsh+=" -o BatchMode=yes -o StrictHostKeyChecking=yes"
+
+/usr/bin/rsync \
+    -aHAXx \
+    --numeric-ids \
+    --delete-delay \
+    --partial \
+    --partial-dir=.rsync-partial \
+    --human-readable \
+    --info=stats2 \
+    --rsync-path="sudo -n rsync" \
+    --rsh="$rsync_rsh" \
+    "$REMOTE_HOST:$REMOTE_STATE/" \
+    "$MIRROR_CURRENT/"
+
+# Protect the mirror root from the source mountpoint's mode.
+chown root:root "$MIRROR_CURRENT"
+chmod 0700 "$MIRROR_CURRENT"
+
+echo "Restarting $REMOTE_UNIT..."
+"${SSH[@]}" "sudo -n systemctl start '$REMOTE_UNIT'"
+"${SSH[@]}" "sudo -n systemctl is-active --quiet '$REMOTE_UNIT'"
+remote_may_need_start=0
+
+for directory in "${EXPECTED_DIRS[@]}"; do
+    if [[ ! -d "$MIRROR_CURRENT/$directory" ]]; then
+        echo "Expected directory is missing: $directory" >&2
+        exit 1
+    fi
+done
+
+echo "Creating Restic snapshot from persistent mirror..."
+
+(
+    cd "$MIRROR_CURRENT"
+
+    /usr/bin/restic \
+        --repo "$RESTIC_REPOSITORY" \
+        --password-file "$RESTIC_PASSWORD_FILE" \
+        --host homelab-vps \
+        backup . \
+        --tag homelab-state \
+        --tag persistent-mirror
+)
+
+echo
+echo "Backup completed successfully."
+echo "Application service is active."
+du -sh "$MIRROR_CURRENT"
+
+/usr/bin/restic \
+    --repo "$RESTIC_REPOSITORY" \
+    --password-file "$RESTIC_PASSWORD_FILE" \
+    snapshots \
+    --host homelab-vps \
+    --tag homelab-state \
+    --latest 2

@@ -1,0 +1,20 @@
+[Unit]
+Description=Pull and snapshot the homelab VPS state
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+
+ExecStart=/usr/local/sbin/homelab-backup
+TimeoutStartSec=30min
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+PrivateTmp=yes
+NoNewPrivileges=yes
